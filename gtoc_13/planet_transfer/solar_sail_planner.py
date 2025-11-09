@@ -9,6 +9,7 @@ from dataclasses import dataclass
 from typing import Tuple, Dict, Any, Callable, Optional, Iterable
 import numpy as np
 import pandas as pd
+from scipy.integrate import solve_ivp
 
 # =============================
 # Constants
@@ -156,75 +157,185 @@ def load_registry_from_csvs(planets_csv, asteroids_csv=None, comets_csv=None) ->
 # =============================
 # Sail dynamics
 # =============================
-# TODO: check vector definitions
-def rtn_frame(r, v):
-    rhat = unit(r)
-    h = np.cross(r, v); hhat = unit(h)
-    that = unit(np.cross(hhat, rhat))
-    return rhat, that, hhat
+# reference frame (RTN) construction
+# def rtn_frame(r, v):
+#     """
+#     Constructs the RTN (Radial, Transverse, Normal) unit vectors:
+#     r_hat: from star -> spacecraft (outward) [for GTOC, we want spacecraft to star]
+#     t_hat: in-plane perpendicular to r_hat (along velocity)
+#     h_hat: out-of-plane angular momentum direction
+#     """
+#     r_hat = unit(r)
+#     h = np.cross(r, v)
+#     h_hat = unit(h)
+#     t_hat = unit(np.cross(h_hat, r_hat))
+#     return r_hat, t_hat, h_hat
 
-def n_from_alpha_sigma(r, v, alpha, sigma):
-    rhat, that, hhat = rtn_frame(r, v)
-    return (np.cos(alpha)*rhat +
-            np.sin(alpha)*(np.cos(sigma)*that + np.sin(sigma)*hhat))
+# sail normal construction
+# def n_from_alpha_sigma(r, v, alpha, sigma):
+#     """
+#     Returns the sail normal vector n_hat for given alpha and sigma.
+    
+#     Definitions:
+#       u_r : from spacecraft → star  = -r_hat
+#       u_t : in-plane tangential direction
+#       u_h : angular momentum normal
+#       alpha : cone angle (0° ≤ α ≤ 90°)
+#       sigma : clock angle (0 ≤ σ < 360°)
+    
+#     Then:
+#       n_hat = cos(α)*u_r + sin(α)*(cos(σ)*u_t + sin(σ)*u_h)
+#     """
+#     r_hat, t_hat, h_hat = rtn_frame(r, v)
+#     u_r = -1*r_hat  # from spacecraft -> star
 
-def sail_accel(r, v, alpha, sigma, K=K_SAIL):
-    # Ideal sail: a = -(K/r^2)*(n·rhat)^2 * n (km/s^2)
-    n = n_from_alpha_sigma(r, v, alpha, sigma)
-    rhat = unit(r); r2 = float(np.dot(r, r))
-    return -K * (1.0/r2) * (float(np.dot(n, rhat))**2) * n
+#     return (np.cos(alpha)*u_r +
+#             np.sin(alpha)*(np.cos(sigma)*t_hat + np.sin(sigma)*h_hat))
 
-def rhs_sail(t, X, alpha, sigma):
+def compute_sail_normal(r_sc, theta, phi):
+    u_r = -1*unit(r_sc)
+    # u_n = np.array([A, B, np.sqrt(1 - A**2 - B**2)])
+    u_n = np.array([np.sin(theta) * np.cos(phi), np.sin(theta) * np.sin(phi), np.cos(theta)])
+
+    if np.dot(u_n, u_r) < 0.0:
+        u_n = -1*u_n
+
+    return u_n
+
+# solar sail accel computation
+def sail_accel(r_sc, theta, phi):
+    """
+    Ideal solar sail acceleration in heliocentric frame
+    a_sail = -2*(C*A/m)*(r0/r)^2 * (u_n·u_r)^2 * u_n
+    where u_r = unit vector spacecraft → star.
+    and u_n is the sail normal vector.
+
+    K_SAIL = 2*(C*A/m)*(r0)^2
+    """
+    u_n = compute_sail_normal(r_sc, theta, phi)
+    u_r = -1*unit(r_sc)
+    r2 = float(np.dot(r_sc, r_sc))
+
+    cos_alpha = np.dot(u_n, u_r)
+    # ensure inward-ish
+    if cos_alpha < 0.0:
+        raise ValueError("Invalid sail orientation: n_hat points away from star")
+
+    a_sail = -1 * K_SAIL * (1.0/r2) * (cos_alpha**2) * u_n
+
+    return a_sail
+
+def sail_accel_from_u_n(r_sc, u_n):
+    u_r = -1*unit(r_sc)
+    r2 = float(np.dot(r_sc, r_sc))
+
+    cos_alpha = np.dot(u_n, u_r)
+    # ensure inward-ish
+    if cos_alpha < 0.0:
+        raise ValueError("Invalid sail orientation: n_hat points away from star")
+
+    a_sail = -1 * K_SAIL * (1.0/r2) * (cos_alpha**2) * u_n
+
+    return a_sail
+
+def sail_rhs(X, A, B):
     r = X[:3]; v = X[3:]
     ar = -MU_STAR * r / (norm(r)**3)
-    asail = sail_accel(r, v, alpha, sigma, K_SAIL)
+    asail = sail_accel(r, v, A, B)
     return np.hstack([v, ar + asail])
 
 # =============================
 # RK4 propagation
 # =============================
-# TODO: match this with base.ipynb
-def rk4_step(fun, t, X, dt, *args):
-    k1 = fun(t, X, *args)
-    k2 = fun(t+0.5*dt, X+0.5*dt*k1, *args)
-    k3 = fun(t+0.5*dt, X+0.5*dt*k2, *args)
-    k4 = fun(t+dt,     X+dt*k3, *args)
-    return X + (dt/6.0)*(k1 + 2*k2 + 2*k3 + k4)
+def propagate_continuous_arc(r0, v0, u0, uf, t0, tf, dt=86400):
+    """
+    Propagate spacecraft trajectory with a continuously varying sail normal vector.
+    It can also be used for any propagation in general.
+    For discontinuous arc, simply put uf = u0
+    """
 
-def propagate_segment(X0, t0, dt, alpha, sigma, nsub=30):
-    h = dt / max(1, nsub)
-    X = X0.copy(); t = t0
-    for _ in range(max(1, nsub)):
-        X = rk4_step(rhs_sail, t, X, h, alpha, sigma)
-        t += h
-    return X, t
+    def slerp(u_start, u_end, s):
+        """
+        Spherical linear interpolation between two unit vectors.
+        """
+        u_start = u_start 
+        u_end = u_end 
+        dot = np.clip(np.dot(u_start, u_end), -1.0, 1.0)
+        theta = np.arccos(dot)
+        if theta < 1e-8:
+            return u_start
+        return (np.sin((1 - s) * theta) * u_start + np.sin(s * theta) * u_end) / np.sin(theta)
 
-def integrate_with_profile(r0, v0, t0, dts, alphas, sigmas, nsub=40):
-    X = np.hstack([r0, v0]); t = t0
-    times = [t]; states = [X.copy()]
-    for k in range(len(dts)):
-        a = float(np.clip(alphas[k], 0.0, 0.5*np.pi))
-        s = float(np.mod(sigmas[k], 2*np.pi))
-        X, t = propagate_segment(X, t, max(1.0, dts[k]), a, s, nsub=nsub)
-        times.append(t); states.append(X.copy())
-    return np.array(times), np.array(states)
+    def dynamics(t, y):
+        r = y[:3]
+        v = y[3:]
+        s = np.clip((t - t0) / (tf - t0), 0, 1)
+        u_n = slerp(u0, uf, s)
+        a_grav = -1 * MU_STAR * r / np.linalg.norm(r)**3
+        a_sail = sail_accel_from_u_n(r, u_n)
+
+        return np.concatenate([v, a_grav + a_sail])
+
+    # Integration grid
+    t_eval = np.arange(t0, tf + dt, dt)
+    t_eval = np.clip(t_eval, t0, tf)
+    t_eval = np.unique(t_eval)  # remove duplicates if any
+    y0 = np.concatenate([r0, v0])
+
+    # possibility to use taylore integration to improve speed
+    sol = solve_ivp(
+        dynamics,
+        [t0, tf],
+        y0,
+        method='RK45',
+        t_eval=t_eval,
+        rtol=1e-14,
+        atol=1e-14
+    )
+
+    # Recompute the interpolated u_n(t)
+    u_hist = [slerp(u0, uf, (t - t0)/(tf - t0)) for t in sol.t]
+    r_hist = sol.y[:3].T
+    v_hist = sol.y[3:].T
+
+    #### Export the solution in GTOC13 format
+    body_id = 0  # heliocentric
+    if np.linalg.norm(u0) == 0:
+        flag = 0     # propagated without solar sail
+    else:
+        flag = 1     # propagated with solar sail       
+    for epoch, (r_vec, v_vec, u_vec) in zip(sol.t, zip(r_hist, v_hist, u_hist)):
+        x, y, z = r_vec
+        vx, vy, vz = v_vec
+        ux, uy, uz = u_vec                      
+        # print only the first and last line to avoid flooding the output, and print to 6 decimal places for epoch 
+        # and 9 decimal places for positions and velocities
+        # you can remove this condition to print all lines if needed
+        if epoch == sol.t[0] or epoch == sol.t[-1]:
+                print(f"{body_id} {flag} {epoch:.6f} {x:.9f} {y:.9f} {z:.9f} {vx:.9f} {vy:.9f} {vz:.9f} {ux:.9f} {uy:.9f} {uz:.9f}")
+
+    return sol.t, r_hist, v_hist, np.array(u_hist)
 
 # =============================
 # Differential Evolution seed
 # =============================
-def pack_vec(dts, alphas, sigmas): return np.concatenate([dts, alphas, sigmas])
+def pack_vec(dts, thetas, phis): return np.concatenate([dts, thetas, phis])
 def unpack_vec(x, N):
-    dts = x[:N]; alphas = x[N:2*N]; sigmas = x[2*N:3*N]
-    return dts, alphas, sigmas
+    dts = x[:N]; thetas = x[N:2*N]; phis = x[2*N:3*N]
+    return dts, thetas, phis
 
 def objective_miss(x, r0, v0, t0, target_ephem, N, nsub=20):
-    dts, alphas, sigmas = unpack_vec(x, N)
+    dts, thetas, phis = unpack_vec(x, N)
     dts = np.maximum(dts, 1.0)
-    alphas = np.clip(alphas, 0.0, 0.5*np.pi)
-    sigmas = np.mod(sigmas, 2*np.pi)
-    X = np.hstack([r0, v0]); t = t0
+
+    thetas = np.mod(thetas, np.pi)
+    phis = np.mod(phis, 2*np.pi)
+
+    X = np.hstack([r0, v0])
+    t = t0
+
     for k in range(N):
-        X, t = propagate_segment(X, t, dts[k], alphas[k], sigmas[k], nsub=nsub)
+        X, t = propagate_segment(X, t, dts[k], thetas[k], phis[k], nsub=nsub)
     r2, v2 = target_ephem(t)
     return norm(X[:3]-r2)
 
@@ -236,10 +347,11 @@ def differential_evolution(r0, v0, t0, tf_range, target_ephem,
     pop = []
     for _ in range(popsize):
         T = rng.uniform(T_min, T_max)
-        raw = rng.uniform(0.0, 1.0, size=N); dts = (raw/np.sum(raw))*T
-        alphas = rng.uniform(0.0, 0.5*np.pi, size=N)
-        sigmas = rng.uniform(0.0, 2*np.pi, size=N)
-        pop.append(pack_vec(dts, alphas, sigmas))
+        raw = rng.uniform(0.0, 1.0, size=N)
+        dts = (raw/np.sum(raw))*T
+        thetas = rng.uniform(0.0, np.pi, size=N)
+        phis = rng.uniform(0.0, 2*np.pi, size=N)
+        pop.append(pack_vec(dts, thetas, phis))
     pop = np.array(pop)
     fit = np.array([objective_miss(ind, r0, v0, t0, target_ephem, N, nsub=12) for ind in pop])
 
@@ -251,18 +363,18 @@ def differential_evolution(r0, v0, t0, tf_range, target_ephem,
             cross = rng.uniform(0,1,mutant.shape) < CR
             jrand = rng.integers(0, len(mutant))
             trial = np.where(cross | (np.arange(len(mutant))==jrand), mutant, pop[i])
-            dts, alphas, sigmas = unpack_vec(trial, N)
+            dts, thetas, phis = unpack_vec(trial, N)
             dts = np.abs(dts); dts = (dts/np.sum(dts))*rng.uniform(T_min, T_max)
-            alphas = np.clip(alphas, 0.0, 0.5*np.pi)
-            sigmas = np.mod(sigmas, 2*np.pi)
-            trial = pack_vec(dts, alphas, sigmas)
+            thetas = np.mod(thetas, np.pi)
+            phis = np.mod(phis, 2*np.pi)
+            trial = pack_vec(dts, thetas, phis)
             f = objective_miss(trial, r0, v0, t0, target_ephem, N, nsub=12)
             if f < fit[i]:
                 pop[i] = trial; fit[i] = f
     j = int(np.argmin(fit))
-    dts, alphas, sigmas = unpack_vec(pop[j], N)
+    dts, thetas, phis = unpack_vec(pop[j], N)
     tf = t0 + np.sum(dts)
-    return dict(dts=dts, alphas=alphas, sigmas=sigmas, tf=tf, miss=float(fit[j]))
+    return dict(dts=dts, thetas=thetas, phis=phis, tf=tf, miss=float(fit[j]))
 
 # =============================
 # Sims–Flanagan (penalty multiple shooting)
@@ -377,3 +489,7 @@ def plan_solar_sail_to_body(r0, v0, t0, target_body,
 #                                   tf_days_range=(5000, 20000),
 #                                   N_segments=10, popsize=22, iters=50, rng_seed=0)
 #     print(json.dumps({k:v for k,v in res.items() if k in ("miss_km","meets_100m_tol","Vinf_km_s","tf")}, indent=2))
+
+# References:
+# 1. https://www.esa.int/gsp/ACT/doc/MAD/pub/ACT-RPR-MAD-2010-(AstroTools)Sundmann.pdf
+# 2. https://esa.github.io/pykep/documentation/simsflanagan.html
