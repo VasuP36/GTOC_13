@@ -328,11 +328,12 @@ def propagate_continuous_arc(r0, v0, u0, uf, t0, tf, dt=86400, print_solution=Fa
     # we return t_hist, r_hist, v_hist, u_hist
     return sol.t, r_hist, v_hist, np.array(u_hist)
 
-def integrate_with_theta_phi_profile(r0, v0, t0, dts, theta0s, phi0s, thetafs, phifs):
+def integrate_with_theta_phi_profile(r0, v0, t0, dts, thetas, phis):
     """
-    Multi-arc integration where each arc k uses a continuous rotation
-    of the sail normal from (theta0s[k], phi0s[k]) to (thetafs[k], phifs[k]).
-    For piecewise-constant arcs, set thetafs == theta0s and phifs == phi0s
+    Multi-arc integration with piecewise-constant sail orientations.
+
+    For each segment k, the sail normal remains fixed with
+    (theta[k], phi[k]) throughout [t_k, t_{k+1}).
     """
     t = t0
     r, v = np.array(r0, float), np.array(v0, float)
@@ -341,18 +342,13 @@ def integrate_with_theta_phi_profile(r0, v0, t0, dts, theta0s, phi0s, thetafs, p
 
     N = len(dts)
     for k in range(N):
-        # build start/end normals using the current r (for the hemisphere check)
-        u0 = compute_sail_normal(r, theta0s[k], phi0s[k])
-        uf = compute_sail_normal(r, thetafs[k], phifs[k])
-
-        # choose an internal output step for solve_ivp
+        u_n = compute_sail_normal(r, thetas[k], phis[k])
         dt_int = max(1.0, min(86400.0, dts[k]/20.0))
-
         t_hist, r_hist, v_hist, _ = propagate_continuous_arc(
-            r, v, u0, uf, t0=t, tf=t + dts[k], dt=dt_int
+            r, v, u_n, u_n, t0=t, tf=t + dts[k], dt=dt_int
         )
         r, v = r_hist[-1], v_hist[-1]
-        t    = t_hist[-1]
+        t = t_hist[-1]
         times.append(t)
         states.append(np.hstack([r, v]))
 
@@ -361,48 +357,34 @@ def integrate_with_theta_phi_profile(r0, v0, t0, dts, theta0s, phi0s, thetafs, p
 # =============================
 # Differential Evolution seed
 # =============================
-def pack_vec(dts, theta0s, phi0s, thetafs, phifs):
-    """
-    Decision vector layout (length = 5N):
-    [ dts | theta0s | phi0s | thetafs | phifs ]
-    """
+def pack_vec(dts, thetas, phis):
+    """Decision vector layout: [ dts | thetas | phis ]"""
     return np.concatenate([np.asarray(dts),
-                           np.asarray(theta0s),
-                           np.asarray(phi0s),
-                           np.asarray(thetafs),
-                           np.asarray(phifs)])
+                           np.asarray(thetas),
+                           np.asarray(phis)])
 
 def unpack_vec(x, N):
-    """
-    Inverse of pack_vec
-    """
+    """Inverse of pack_vec"""
     x = np.asarray(x)
-    dts     = x[:N]
-    theta0s = x[N:2*N]
-    phi0s   = x[2*N:3*N]
-    thetafs = x[3*N:4*N]
-    phifs   = x[4*N:5*N]
-    return dts, theta0s, phi0s, thetafs, phifs
+    dts = x[:N]
+    thetas = x[N:2*N]
+    phis = x[2*N:3*N]
+    return dts, thetas, phis
 
 def objective_miss(x, r0, v0, t0, target_ephem, N):
     """
-    Final position miss distance after N arcs with continuous (θ, φ) rotations.
-    Decision vector: [ dts | theta0s | phi0s | thetafs | phifs ]
+    Compute final position error (miss distance) after N arcs
+    with constant sail orientations per arc.
     """
-    # unpack decision vector
-    dts, theta0s, phi0s, thetafs, phifs = unpack_vec(x, N)
+    dts, thetas, phis = unpack_vec(x, N)
 
-    # sanitize/box the decision vars
+    # Clamp/sanitize values
     dts     = np.maximum(dts, 1.0)
-    theta0s = np.mod(theta0s, np.pi)
-    thetafs = np.mod(thetafs, np.pi)
-    phi0s   = np.mod(phi0s, 2*np.pi)
-    phifs   = np.mod(phifs, 2*np.pi)
+    thetas  = np.mod(thetas, np.pi)
+    phis    = np.mod(phis, 2*np.pi)
 
-    # propagate over all arcs
-    times, states = integrate_with_theta_phi_profile(
-        r0, v0, t0, dts, theta0s, phi0s, thetafs, phifs
-    )
+    # Propagate full trajectory
+    times, states = integrate_with_theta_phi_profile(r0, v0, t0, dts, thetas, phis)
     rf, vf = states[-1, :3], states[-1, 3:]
     r_target, v_target = target_ephem(times[-1])
 
@@ -417,123 +399,100 @@ def differential_evolution(r0, v0, t0, tf_range, target_ephem,
     T_max = max(T_min+1.0, tf_range[1]-t0)
 
     def random_individual():
-        # random durations that sum to a random T in [T_min, T_max]
         raw = rng.uniform(0.0, 1.0, size=N)
-        T   = rng.uniform(T_min, T_max)
-        dts = (raw/np.sum(raw))*T
-        theta0s = rng.uniform(0.0, np.pi,    size=N)
-        phi0s   = rng.uniform(0.0, 2*np.pi,  size=N)
-        # for general continuous arcs, pick independent end-angles
-        thetafs = rng.uniform(0.0, np.pi,    size=N)
-        phifs   = rng.uniform(0.0, 2*np.pi,  size=N)
-        return pack_vec(dts, theta0s, phi0s, thetafs, phifs)
+        T = rng.uniform(T_min, T_max)
+        dts = (raw/np.sum(raw)) * T
+        thetas = rng.uniform(0.0, np.pi, size=N)
+        phis   = rng.uniform(0.0, 2*np.pi, size=N)
+        return pack_vec(dts, thetas, phis)
     
     # initial population
     pop = np.array([random_individual() for _ in range(popsize)])
     fit = np.array([objective_miss(ind, r0, v0, t0, target_ephem, N) for ind in pop])
 
     # length of decision vector
-    D = 5*N
+    D = 3*N
 
     for _ in range(iters):
         for i in range(popsize):
-            # mutation
             idxs = [j for j in range(popsize) if j != i]
             a, b, c = pop[rng.choice(idxs, 3, replace=False)]
-            mutant = a + F*(b - c)
+            mutant = a + F * (b - c)
 
-            # crossover (binomial)
+            # binomial crossover
             cross = rng.uniform(0, 1, D) < CR
             jrand = rng.integers(0, D)
             trial = np.where(cross | (np.arange(D) == jrand), mutant, pop[i])
 
             # enforce variable domains
-            dts, theta0s, phi0s, thetafs, phifs = unpack_vec(trial, N)
-
-            # durations: positive and renormalize total to a random T in [T_min, T_max]
+            dts, thetas, phis = unpack_vec(trial, N)
             dts = np.abs(dts)
             if np.sum(dts) <= 0:
                 dts = np.ones_like(dts)
             dts = (dts/np.sum(dts)) * rng.uniform(T_min, T_max)
+            thetas = np.mod(thetas, np.pi)
+            phis   = np.mod(phis, 2*np.pi)
+            trial = pack_vec(dts, thetas, phis)
 
-            # angles in-range
-            theta0s = np.mod(theta0s, np.pi)
-            thetafs = np.mod(thetafs, np.pi)
-            phi0s   = np.mod(phi0s,   2*np.pi)
-            phifs   = np.mod(phifs,   2*np.pi)
-
-            trial = pack_vec(dts, theta0s, phi0s, thetafs, phifs)
-
-            # selection
             f = objective_miss(trial, r0, v0, t0, target_ephem, N)
             if f < fit[i]:
                 pop[i], fit[i] = trial, f
 
-    j  = int(np.argmin(fit))
-    dts, theta0s, phi0s, thetafs, phifs = unpack_vec(pop[j], N)
+    j = int(np.argmin(fit))
+    dts, thetas, phis = unpack_vec(pop[j], N)
     tf = t0 + float(np.sum(dts))
-    return dict(dts=dts, theta0s=theta0s, phi0s=phi0s, thetafs=thetafs, phifs=phifs,
-                tf=tf, miss=float(fit[j]))
+    return dict(dts=dts, thetas=thetas, phis=phis, tf=tf, miss=float(fit[j]))
 
 # =============================
 # Sims–Flanagan (penalty multiple shooting)
 # =============================
 def sims_flanagan_refine(r0, v0, t0, target_ephem, seed, steps=220, step_scale=0.05, rng_seed=0):
     """
-    Penalty multiple shooting with continuous arcs defined by (θ0, φ0) → (θf, φf) per segment.
+    Penalty multiple shooting with piecewise-constant sail orientation:
+    in segment k, u_n is fixed by (thetas[k], phis[k]).
     """
-    dts     = seed['dts'].copy()
-    theta0s = seed['theta0s'].copy()
-    phi0s   = seed['phi0s'].copy()
-    thetafs = seed['thetafs'].copy()
-    phifs   = seed['phifs'].copy()
+    dts    = seed['dts'].copy()
+    thetas = seed['thetas'].copy()
+    phis   = seed['phis'].copy()
     N = len(dts)
 
-    # initial coarse propagation to get internal nodes
-    times, states = integrate_with_theta_phi_profile(
-        r0, v0, t0, dts, theta0s, phi0s, thetafs, phifs
-    )
-    Xnodes = states[1:-1].copy() # interior nodes (N-1 of them)
+    # initial coarse propagation to get interior nodes (N-1)
+    times, states = integrate_with_theta_phi_profile(r0, v0, t0, dts, thetas, phis)
+    Xnodes = states[1:-1].copy()
 
-    def defects(dts, theta0s, phi0s, thetafs, phifs, Xnodes):
+    def defects(dts, thetas, phis, Xnodes):
         cons = []
         t = t0
-        # nodes: initial state + interior guesses
         nodes = [np.hstack([r0, v0])] + [Xnodes[k] for k in range(N-1)]
         for k in range(N):
             Xk = nodes[k]
             r, v = Xk[:3], Xk[3:]
-
-            u0 = compute_sail_normal(r, theta0s[k], phi0s[k])
-            uf = compute_sail_normal(r, thetafs[k], phifs[k])
+            u = compute_sail_normal(r, thetas[k], phis[k])
 
             dt_int = max(1.0, min(86400.0, dts[k]/20.0))
             t_hist, r_hist, v_hist, _ = propagate_continuous_arc(
-                r, v, u0, uf, t, t + dts[k], dt=dt_int
+                r, v, u, u, t0=t, tf=t + dts[k], dt=dt_int
             )
             Xp = np.hstack([r_hist[-1], v_hist[-1]])
             t  = t_hist[-1]
             if k < N-1:
-                cons.append(Xp - nodes[k+1])   # defect to the next node
+                cons.append(Xp - nodes[k+1])  # mismatch to next node
         return np.concatenate(cons) if cons else np.zeros(0)
 
-    def score(dts, theta0s, phi0s, thetafs, phifs, Xnodes):
+    def score(dts, thetas, phis, Xnodes):
         # sanitize
-        dts     = np.maximum(dts, 1.0)
-        theta0s = np.mod(theta0s, np.pi)
-        thetafs = np.mod(thetafs, np.pi)
-        phi0s   = np.mod(phi0s,   2*np.pi)
-        phifs   = np.mod(phifs,   2*np.pi)
+        dts    = np.maximum(dts, 1.0)
+        thetas = np.mod(thetas, np.pi)
+        phis   = np.mod(phis,   2*np.pi)
 
         t = t0
         r, v = np.array(r0, float), np.array(v0, float)
 
         for k in range(N):
-            u0 = compute_sail_normal(r, theta0s[k], phi0s[k])
-            uf = compute_sail_normal(r, thetafs[k], phifs[k])
+            u = compute_sail_normal(r, thetas[k], phis[k])
             dt_int = max(1.0, min(86400.0, dts[k]/20.0))
             t_hist, r_hist, v_hist, _ = propagate_continuous_arc(
-                r, v, u0, uf, t, t + dts[k], dt=dt_int
+                r, v, u, u, t0=t, tf=t + dts[k], dt=dt_int
             )
             r, v = r_hist[-1], v_hist[-1]
             t    = t_hist[-1]
@@ -542,15 +501,15 @@ def sims_flanagan_refine(r0, v0, t0, target_ephem, seed, steps=220, step_scale=0
         miss   = norm(r - r2)
         Vinf   = norm(v - v2)
 
-        # same shaping as your original
+        # shaping (same as your original)
         F = 0.2 + np.exp(-Vinf/13.0)/(1.0 + np.exp(-5.0*(Vinf-1.5)))
         J = miss - 1e3*F
 
-        D = defects(dts, theta0s, phi0s, thetafs, phifs, Xnodes)
+        D = defects(dts, thetas, phis, Xnodes)
         J += 1e5 * np.sum(np.abs(D))
         return J, miss, Vinf, t
 
-    best = (dts.copy(), theta0s.copy(), phi0s.copy(), thetafs.copy(), phifs.copy(), Xnodes.copy())
+    best = (dts.copy(), thetas.copy(), phis.copy(), Xnodes.copy())
     bestJ, bestMiss, bestVinf, best_t = score(*best)
 
     rng = np.random.default_rng(rng_seed)
@@ -562,18 +521,16 @@ def sims_flanagan_refine(r0, v0, t0, target_ephem, seed, steps=220, step_scale=0
         cand = (best[0] + rng.normal(scale=scale_d),
                 best[1] + rng.normal(scale=scale_th, size=N),
                 best[2] + rng.normal(scale=scale_ph, size=N),
-                best[3] + rng.normal(scale=scale_th, size=N),
-                best[4] + rng.normal(scale=scale_ph, size=N),
-                best[5] + rng.normal(scale=0.01, size=best[5].shape))
+                best[3] + rng.normal(scale=0.01, size=best[3].shape))
         J, miss, Vinf, _ = score(*cand)
         if J < bestJ:
             best, bestJ, bestMiss, bestVinf = cand, J, miss, Vinf
             scale_d *= 0.99
 
-    dts, theta0s, phi0s, thetafs, phifs, Xnodes = best
-    times, states = integrate_with_theta_phi_profile(r0, v0, t0, dts, theta0s, phi0s, thetafs, phifs)
+    dts, thetas, phis, Xnodes = best
+    times, states = integrate_with_theta_phi_profile(r0, v0, t0, dts, thetas, phis)
 
-    return dict(dts=dts, theta0s=theta0s, phi0s=phi0s, thetafs=thetafs, phifs=phifs,
+    return dict(dts=dts, thetas=thetas, phis=phis,
                 tf=times[-1], times=times, states=states,
                 miss=bestMiss, Vinf=bestVinf)
 
@@ -584,8 +541,7 @@ def verify_to_target(r0, v0, t0, profile, target_ephem):
     times, states = integrate_with_theta_phi_profile(
         r0, v0, t0,
         profile['dts'],
-        profile['theta0s'], profile['phi0s'],
-        profile['thetafs'], profile['phifs']
+        profile['thetas'], profile['phis']
     )
     rf, vf = states[-1, :3], states[-1, 3:]
     r2, v2 = target_ephem(times[-1])
@@ -599,52 +555,39 @@ def plan_solar_sail_to_body(r0, v0, t0, target_body,
                             iters: int = 50,
                             rng_seed: int = 0):
     """
-    High-level planner for a solar sail trajectory from initial state (r0, v0)
-    to a target body using spherical-angle control and continuous sail arcs.
+    Plan a solar sail trajectory using piecewise-constant sail orientations
+    (one (theta, phi) per segment).
     """
     r0 = np.array(r0, dtype=float)
     v0 = np.array(v0, dtype=float)
 
-    # Target ephemeris
     target_ephem = ephem_from_body(target_body)
 
-    # Convert day-range to seconds
     tf_range = (tf_days_range[0]*DAY + t0,
                 tf_days_range[1]*DAY + t0)
 
-    # 1. Differential Evolution global search
+    # 1) Global search (DE) — returns dts, thetas, phis
     seed = differential_evolution(
         r0, v0, t0, tf_range, target_ephem,
-        N=N_segments,
-        popsize=popsize,
-        iters=iters,
-        seed=rng_seed
+        N=N_segments, popsize=popsize, iters=iters, seed=rng_seed
     )
 
-    # 2. Sims–Flanagan local refinement
+    # 2) Local refine (penalty multiple shooting)
     profile = sims_flanagan_refine(
         r0, v0, t0, target_ephem, seed,
-        steps=220,
-        step_scale=0.05,
-        rng_seed=rng_seed
+        steps=220, step_scale=0.05, rng_seed=rng_seed
     )
 
-    # 3. High-fidelity verification
+    # 3) Verify
     verify = verify_to_target(r0, v0, t0, profile, target_ephem)
 
-    # 4. Compose final structured output
     out = {
-        "target": {
-            "id": target_body.id,
-            "name": target_body.name
-        },
+        "target": {"id": target_body.id, "name": target_body.name},
         "t0": float(t0),
         "tf": float(profile["tf"]),
         "dts": np.array(profile["dts"]).tolist(),
-        "theta0s": np.array(profile["theta0s"]).tolist(),
-        "phi0s": np.array(profile["phi0s"]).tolist(),
-        "thetafs": np.array(profile["thetafs"]).tolist(),
-        "phifs": np.array(profile["phifs"]).tolist(),
+        "thetas": np.array(profile["thetas"]).tolist(),
+        "phis":   np.array(profile["phis"]).tolist(),
         "miss_km": float(verify["miss"]),
         "Vinf_km_s": float(verify["Vinf"]),
         "times": np.array(verify["times"]).tolist(),
@@ -652,24 +595,9 @@ def plan_solar_sail_to_body(r0, v0, t0, target_body,
         "AU_km": float(AU),
         "MU_star": float(MU_STAR),
         "A1_AU_km_s2": float(A1_AU_KM),
-        # 100-m tolerance criterion
         "meets_100m_tol": bool(float(verify["miss"]) <= 1e-4)
     }
-
     return out
-
-# -----------------------------
-# example usage
-# -----------------------------
-# if __name__ == "__main__":
-#     bodies = load_registry_from_csvs("gtoc13_planets.csv")
-#     planetx = next(b for b in bodies.values() if b.name.lower()=="planetx")
-#     r0 = np.array([-200.0*AU, 0.0, 0.0])
-#     v0 = np.array([25.0, 0.0, 0.0])
-#     res = plan_solar_sail_to_body(r0, v0, 0.0, planetx,
-#                                   tf_days_range=(5000, 20000),
-#                                   N_segments=10, popsize=22, iters=50, rng_seed=0)
-#     print(json.dumps({k:v for k,v in res.items() if k in ("miss_km","meets_100m_tol","Vinf_km_s","tf")}, indent=2))
 
 # References:
 # 1. https://www.esa.int/gsp/ACT/doc/MAD/pub/ACT-RPR-MAD-2010-(AstroTools)Sundmann.pdf
