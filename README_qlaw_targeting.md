@@ -1,193 +1,241 @@
-Perfect — that’s the right time to formalize this into a **mini operating manual** so anyone in your lab (or a future you) can pick it up and get meaningful results.
-Here’s a clean, concise **instruction manual** for your `solar_sail_q_law_final.py` simulation, written like a proper internal research note.
+```markdown
+# 🚀 Solar Sail Q-Law Targeting Simulation
+
+This repository contains a Python-based numerical simulation of **solar sail trajectory optimization using the Q-law** (Lyapunov-based control). It allows simulation of **planet-to-planet transfers** using a fully dynamic solar sail model, adaptive integration, and automated flyby detection.
 
 ---
 
-## 🚀 **Solar Sail Q-Law Targeting Simulation Manual**
+## 🛰 Overview
 
-**Script:** `solar_sail_q_law_final.py`
-**Purpose:**
-Numerically simulate solar sail trajectory optimization using the **Q-law** (Lyapunov-based control) for **planet-to-planet transfers**, with:
+The **Q-law** (from Petropoulos, 2004) provides a Lyapunov control framework for continuous low-thrust (or solar sail) trajectory shaping.  
+This script implements a **fully numerical version** of that formulation using **Modified Equinoctial Elements (MEE)** with finite-difference dynamics.  
 
-* Finite-difference–based MEE dynamics (`B` matrix)
-* Adaptive RK45 integration
-* Realistic solar sail acceleration model
-* Flyby detection and optional GIF visualizations
+Key features:
+- Finite-difference based B-matrix relating RTN accelerations to MEE rates  
+- Adaptive RK45 integration with tolerance control  
+- Realistic RTN-frame solar sail acceleration model  
+- Planetary ephemerides derived from user-supplied CSV  
+- Flyby detection with `v_inf` computation  
+- Animated 2D orbit GIFs (XY and YZ planes)
 
 ---
 
-### ⚙️ 1. **Setup and Input Data**
+## ⚙️ Input and Usage
 
-**Input file required:**
-`gtoc13_planets.csv` — must contain:
-
+### Required Input
+A CSV file `gtoc13_planets.csv` containing:
 ```
+
 #Planet ID, Name, GM (km3/s2), Radius (km),
 Semi-Major Axis (km), Eccentricity (), Inclination (deg),
 Longitude of the Ascending Node (deg), Argument of Periapsis (deg),
 Mean Anomaly at t=0 (deg), Weight ()
+
 ```
 
-> For reference, GTOC13 planet entries (like Vulcan, Yavin, Eden) already work out-of-the-box.
+For example:
+```
 
----
+1,Vulcan,658906373.320,133020.700,13811982.942,0.000,0.000,0.000,315.372,322.584,0.1
+2,Yavin,6363037.484,18013.200,128528229.968,0.050,3.000,110.499,148.135,155.310,1
+3,Eden,443853.559,6697.400,179517444.840,0.007,1.000,107.472,356.208,51.897,2
 
-### 🧭 2. **Basic Usage**
+````
 
-Run directly:
-
+### Run the Simulation
 ```bash
 python3 solar_sail_q_law_final.py
-```
+````
 
-What it does:
+It will:
 
-1. Reads `gtoc13_planets.csv`.
-2. Initializes a solar sail model.
-3. Runs Q-law–based transfer from `dep_id` → `arr_id`.
-4. Plots trajectory, control angles, and optional GIFs.
-5. Stops automatically if a **flyby** occurs (within 1.01–101 × planetary radii).
+1. Read the planet dataset
+2. Initialize sail and planetary states
+3. Run the Q-law integration from departure to arrival
+4. Plot and optionally animate results
+5. Stop automatically upon detecting a **flyby**
 
 ---
 
-### 🪶 3. **Adjustable Parameters**
+## 🧭 Core Parameters
 
-All tunable parameters are near the top of the script.
+All tunable constants are located at the top of the script.
 
-| Parameter                 | Description                                        | Typical Range / Notes                                                             |
-| ------------------------- | -------------------------------------------------- | --------------------------------------------------------------------------------- |
-| `MU_SUN`                  | Solar GM constant                                  | Keep default                                                                      |
-| `FD_DT`                   | Time step for numeric finite-diff of MEEs          | 1–10 s; smaller = more accurate but slower                                        |
-| `EPS_A`                   | Perturbation magnitude for B-matrix FD             | ~1e-7 to 1e-6 km/s²; too small → noisy, too big → nonlinear error                 |
-| `W_P, W_F, W_G, W_H, W_K` | Q-law weights (per MEE component)                  | Tune to prioritize elements; `W_P` controls semi-major axis rate (transfer speed) |
-| `DELTA_P, DELTA_F, ...`   | Scaling (Δ) for normalization in Lyapunov function | Usually not changed unless element scales differ greatly                          |
-| `sail_params`             | Dict in class: `{sail_C, sail_A, sail_m}`          | Physical sail model; tuning this drastically changes transfer rate                |
+| Parameter                 | Description                                 | Recommended Range          |
+| ------------------------- | ------------------------------------------- | -------------------------- |
+| `FD_DT`                   | Finite-difference step for MEE dynamics (s) | 1–10                       |
+| `EPS_A`                   | Perturbation for numeric B-matrix (km/s²)   | 1e-7 – 1e-6                |
+| `W_P, W_F, W_G, W_H, W_K` | Q-law weights for p, f, g, h, k             | Adjust to tune convergence |
+| `DELTA_P...DELTA_K`       | Scaling values for Q computation            | Usually fixed              |
+| `sail_C`                  | Sail light pressure constant (N/m² @ 1 AU)  | ~5.4e-6                    |
+| `sail_A`                  | Sail area (m²)                              | 10,000–20,000              |
+| `sail_m`                  | Spacecraft mass (kg)                        | 300–700                    |
 
-#### Example:
+Example:
 
 ```python
 self.sail_params = {
-    'sail_C': 5.4026e-6,   # N/m² at 1 AU
-    'sail_A': 15e3,        # m² (sail area)
-    'sail_m': 500.0        # kg (spacecraft mass)
+    'sail_C': 5.4026e-6,
+    'sail_A': 15000,
+    'sail_m': 500
 }
 ```
 
-Increasing area or decreasing mass → faster acceleration.
+Increasing area or reducing mass increases acceleration.
 
 ---
 
-### 🧮 4. **Control Logic (Q-law Overview)**
+## 🧮 Control Law Details
 
-The Q-law computes sail orientation (`α`, `δ`) that minimizes the Lyapunov function
-[
-Q = \frac{1}{2}\sum_i \left(\frac{(x_i - x_i^*)}{w_i \Delta_i}\right)^2
-]
+The Q-law minimizes a Lyapunov function:
+
+$$
+Q = \frac{1}{2}\sum_{i} \left( \frac{x_{i} - x_{i}^{*}}{w_{i} \Delta_{i}} \right)^{2}
+$$
+
+where ($x_{i}$) are current MEEs and ($x_{i}^{*}$) are target MEEs.
+
+The gradient ($\nabla Q$) is combined with the numeric B-matrix:
+
+$$
+\dot{Q} = \mathbf{g}^{\mathsf{T}} \mathbf{a}_{\mathrm{RTN}} + c
+$$
+
+The control angles $\alpha$ and $\delta$ are chosen analytically to minimize ($\dot{Q}$) subject to sail geometry:
+
+* $\alpha$ = cone angle (0–90°)
+* $\delta$ = clock angle (0–360°)
+* Acceleration magnitude $\cos^{2} \alpha$
 where (x_i) are current MEEs and (x_i^*) are target MEEs.
+The gradient (\nabla Q) is combined with the numeric B-matrix:
+[
+\dot{Q} = g^T a_{RTN} + c
+]
 
-* The gradient `∂Q/∂x` is used with numeric B-matrix to form:
-  [
-  \dot{Q} = g^T a_{RTN} + c
-  ]
-* Then, α and δ are chosen analytically (within constraints) to minimize ( \dot{Q} ).
+The control angles α and δ are chosen analytically to minimize ( \dot{Q} ) subject to sail geometry:
 
----
-
-### 🧰 5. **Key Subsystems**
-
-| Subsystem                                     | Description                                                        |
-| --------------------------------------------- | ------------------------------------------------------------------ |
-| `compute_mees_dot_numeric()`                  | Finite-difference propagation of MEEs for RTN acceleration input   |
-| `build_B_numeric()`                           | Builds local linearized B-matrix relating RTN accel → MEE rates    |
-| `compute_g_and_c()`                           | Computes Lyapunov gradient (g) and offset (c)                      |
-| `find_optimal_alpha() / find_optimal_delta()` | Solve for Q-law steering angles                                    |
-| `rk45_step()`                                 | Adaptive integration (1 step of dynamics)                          |
-| `run_q_law()`                                 | Main loop; integrates while updating α, δ, and checking for flybys |
+* α = cone angle (0–90°)
+* δ = clock angle (0–360°)
+* Acceleration magnitude ∝ cos²(α)
 
 ---
 
-### 🛰️ 6. **Flyby Detection**
+## 🧰 Numerical Implementation
 
-Within each integration step, spacecraft–arrival distance is checked:
+| Function                                       | Role                                                       |
+| ---------------------------------------------- | ---------------------------------------------------------- |
+| `compute_mees_dot_numeric()`                   | Computes finite-difference MEE rates for RTN accelerations |
+| `build_B_numeric()`                            | Constructs local B-matrix (6×3)                            |
+| `compute_g_and_c()`                            | Computes Lyapunov gradient and offset                      |
+| `find_optimal_alpha()`, `find_optimal_delta()` | Compute sail control angles                                |
+| `rk45_step()`                                  | Adaptive integrator with `rtol`/`atol` control             |
+| `run_q_law()`                                  | Main loop: updates α, δ, integrates, checks flybys         |
+| `make_gif()` / `make_gif_yz()`                 | Create orbit animations in XY and YZ planes                |
+
+---
+
+## 🛰 Flyby Detection
+
+During propagation, the spacecraft–arrival distance is checked each step:
 
 ```python
 if (1.01 * R_arr) <= rel_dist <= (101.0 * R_arr):
-    print(f"Flyby detected at {t/86400:.2f} days → distance={rel_dist/R_arr:.1f} R, v_inf={v_inf:.3f} km/s")
+    print(f"Flyby detected at {t/86400:.2f} days → "
+          f"distance={rel_dist/R_arr:.1f} R, v_inf={v_inf:.3f} km/s")
     break
 ```
 
-* **Stopping criterion:** simulation ends at first flyby.
-* **`v_inf`** is the relative velocity magnitude (km/s).
-* To detect **multiple flybys**, remove the `break` and store events in a list.
+* Stops simulation at first flyby
+* `v_inf` is computed from relative velocity vector
+* To log multiple encounters, remove `break` and store results in a list
 
 ---
 
-### 🎥 7. **GIF Visualization**
+## 🎥 Visual Outputs
 
-Two convenience methods produce orbit animations:
+After simulation, the script generates:
 
-| Method                                        | Description                                       | Notes                                        |
-| --------------------------------------------- | ------------------------------------------------- | -------------------------------------------- |
-| `make_gif(data, dep_id, arr_id, yearly=True)` | Top-down XY orbit view (yearly or monthly frames) | Shows Sun, spacecraft, dep/arr planets       |
-| `make_gif_yz(data, dep_id, arr_id)`           | Side-view (YZ-plane)                              | Same setup, useful for inclination evolution |
+* `solar_sail_xy.gif`: Orbit evolution in the ecliptic plane (x–y)
+* `solar_sail_yz.gif`: Inclination and out-of-plane view (y–z)
+* `plot_trajectory.png`: Static 2D trajectory
+* `control_angles.png`: α and δ vs time
+* `Q_vs_time.png`: Lyapunov function evolution
 
-Both automatically color-code:
+Each GIF shows:
 
-* 🟢 Departure planet
-* 🔴 Arrival planet
-* 🟡 Sun (Altaira)
-* 🔵 Spacecraft trajectory
+* 🟡 **Sun (Altaira)** at origin
+* 🟢 **Departure planet**
+* 🔴 **Arrival planet**
+* 🔵 **Spacecraft** moving over time
 
----
-
-### 🪜 8. **Debugging and Fine-Tuning Workflow**
-
-| Symptom                         | Likely Cause                                                 | Fix                                                  |
-| ------------------------------- | ------------------------------------------------------------ | ---------------------------------------------------- |
-| Spacecraft shoots off radially  | α/δ logic wrong or sail too strong                           | Clamp α to ≤ 85° or reduce `sail_A/m`                |
-| Orbit never expands             | Sail too weak or weights penalize `p` too little             | Increase `W_P` or reduce mass                        |
-| α locked near 90°               | Gradients nearly zero (no meaningful Q variation)            | Increase `FD_DT` or `EPS_A` for B-matrix sensitivity |
-| Simulation stalls               | `FD_DT` too small (numerical noise)                          | Use 5–10 s                                           |
-| No flyby detection              | Target orbit mismatch (Q too small)                          | Verify `arr_id` and timing (T_days)                  |
-| Unstable oscillations in angles | Try lowering `W_F, W_G`, or increase `rtol` in `rk45_step()` |                                                      |
+Frames are sampled at 1 year or 1 month intervals.
 
 ---
 
-### 📈 9. **Typical Parameter Setups**
+## 🧠 Debugging and Fine-Tuning
 
-| Scenario                       | `sail_A` (m²) | `sail_m` (kg) | `W_P` | `FD_DT` (s) | Comment                              |
-| ------------------------------ | ------------- | ------------- | ----- | ----------- | ------------------------------------ |
-| **Fast transfer (aggressive)** | 20,000        | 300           | 0.5   | 5           | Converges quickly, but may oscillate |
-| **Realistic demo**             | 15,000        | 500           | 0.2   | 10          | Balanced, good baseline              |
-| **Gentle orbit raising**       | 10,000        | 700           | 0.1   | 10          | Smooth α evolution, slow convergence |
-
----
-
-### 🧠 10. **Extending the Script**
-
-* **Multi-planet patching:** store flyby outputs, then relaunch `run_q_law()` for next leg.
-* **Optimization sweeps:** wrap parameters (sail_A/m, W_P, FD_DT) in an outer loop and compare Q reduction rate.
-* **Batch runs:** automate using YAML input (planet pairs + duration).
+| Symptom                        | Likely Cause                               | Adjustment                            |
+| ------------------------------ | ------------------------------------------ | ------------------------------------- |
+| Spacecraft shoots off straight | Wrong α/δ handling or sail too strong      | Clamp α < 85°, reduce sail area       |
+| Orbit doesn’t expand           | Sail too weak / low `W_P`                  | Increase `W_P`, decrease mass         |
+| α stuck at 90°                 | Flat gradient (numerical B too small)      | Increase `FD_DT` or `EPS_A`           |
+| Simulation too noisy           | FD_DT too small                            | Use 5–10 s                            |
+| Never reaches target           | Duration too short or Q weights unbalanced | Extend `T_days`, tune `W_F, W_G`      |
+| Oscillating α/δ                | Step too coarse or weights too aggressive  | Increase RK45 `rtol`, reduce W values |
 
 ---
 
-### 📊 11. **Outputs and Logs**
+## 📊 Typical Parameter Sets
 
-You’ll see debug output like:
+| Scenario             | sail_A (m²) | sail_m (kg) | W_P | FD_DT (s) | Notes                                  |
+| -------------------- | ----------- | ----------- | --- | --------- | -------------------------------------- |
+| Fast transfer        | 20000       | 300         | 0.5 | 5         | Quick convergence, risk of oscillation |
+| Realistic baseline   | 15000       | 500         | 0.2 | 10        | Balanced, stable behavior              |
+| Gentle orbit raising | 10000       | 700         | 0.1 | 10        | Smooth evolution, slower transfer      |
+
+---
+
+## 🧩 Extending the Model
+
+* **Multi-leg missions:** Chain multiple `run_q_law()` calls using flyby outputs as initial conditions.
+* **Batch optimization:** Loop over sail area/mass and Q-law weights to study performance sensitivity.
+* **Alternate dynamics:** Replace numeric `build_B_numeric()` with analytical MEE Jacobian if desired.
+* **Integration sweeps:** Automate convergence testing using YAML configs or Jupyter widgets.
+
+---
+
+## 🧾 Outputs and Logs
+
+Example console output:
 
 ```
+Simulating Vulcan → Yavin
 DEBUG: mee=[1.381198e+07, 0.0, 0.0, 0.0, 0.0], g=[-0.000, 0.015, 0.076], Q=0.004201
-🚀 Flyby detected at t = 1245.3 days → distance = 30.2 R, v_inf = 2.853 km/s
+Flyby detected at t = 1245.3 days → distance = 30.2 R, v_inf = 2.853 km/s
 ```
-
-Files generated:
-
-* `solar_sail_xy.gif` — top-down orbital animation
-* `solar_sail_yz.gif` — inclination evolution
-* `plot_trajectory.png` — static 2D trajectory
-* `control_angles.png` — α, δ vs time
 
 ---
 
-Would you like me to append this as a **header docstring block** to the top of your working script (so the next user sees it right away when opening the file)?
-I can format it so it appears as a neatly commented “user manual” inside the code.
+## 🪶 Notes
+
+* This implementation uses **RTN-based sail acceleration** consistent with physical solar sail geometry (thrust away from Sun).
+* α is measured from the anti-sun direction (so 0° = facing Sun, 90° = edge-on).
+* Ensure your time horizon `T_days` is large enough (typically 3–15 years) to allow convergence.
+* The system is fully nondimensionalizable if scaling for optimization or mission design sweeps is needed.
+
+---
+
+## 📚 References
+
+1. Petropoulos, A.E. *Low-Thrust Trajectory Optimization Using a Q-Law*. AAS 04-108, 2004.
+2. McInnes, C.R. *Solar Sailing: Technology, Dynamics, and Mission Applications*, Springer-Praxis, 1999.
+3. Yuricst et al., *pyqlaw* ([https://github.com/Yuricst/pyqlaw](https://github.com/Yuricst/pyqlaw))
+
+---
+
+**Author:** Internal Lab Adaptation of the Q-Law Framework
+**Version:** 1.0 — Stable baseline with flyby and visualization support
+**License:** For academic / research use only
+
+```
+```
